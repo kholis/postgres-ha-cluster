@@ -79,6 +79,8 @@ export ETCD_CLUSTER="etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http:
 export ETCD_CLIENTS="etcd1:2379,etcd2:2379,etcd3:2379"
 # Basic auth header for Patroni REST API checks (haproxy/prometheus/healthcheck)
 export PATRONI_BASIC_AUTH=$(printf 'patroni:%s' "${CHECK_PASSWORD}" | base64 | tr -d '\n')
+# Password percent-encoded for use inside a postgres DSN URI (base64 has / and =)
+export CHECK_PASSWORD_ENC=$(python3 -c 'import urllib.parse,os;print(urllib.parse.quote(os.environ["CHECK_PASSWORD"],safe=""))')
 
 # Calculate resource limits based on available system resources
 export PG_MEM_LIMIT=${PG_MEM_LIMIT:-$((TOTAL_MEM / 4))}M
@@ -625,7 +627,29 @@ services:
       timeout: 10s
       retries: 3
 
-
+  # -------------------------------------------------------------------------
+  # PostgreSQL metrics exporter (feeds the PostgreSQL Grafana dashboard)
+  # -------------------------------------------------------------------------
+  postgres-exporter:
+    # v0.15 = last version with simple DATA_SOURCE_NAME env (v0.16+ needs
+    # the new auth_modules config schema)
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    hostname: postgres-exporter
+    networks: [pgnet]
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://monitor:${CHECK_PASSWORD_ENC}@haproxy:5432/postgres?sslmode=disable"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.2'
+        reservations:
+          memory: 64M
+          cpus: '0.05'
+    restart: unless-stopped
 
   # -------------------------------------------------------------------------
   # Monitoring with Prometheus + Grafana
@@ -657,13 +681,15 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:10.0.3
+    image: grafana/grafana:12.4.11
     hostname: grafana
     networks: [pgnet]
     ports:
       - "3000:3000"
     environment:
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "${POSTGRES_PASSWORD}"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
@@ -715,6 +741,12 @@ scrape_configs:
       - targets: ['etcd1:2379', 'etcd2:2379', 'etcd3:2379']
     metrics_path: /metrics
     scrape_interval: 10s
+
+  - job_name: 'postgresql-exporter'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    metrics_path: /metrics
+    scrape_interval: 10s
 EOF
 envsubst < config/prometheus.yml > config/prometheus.yml.tmp && mv config/prometheus.yml.tmp config/prometheus.yml
 
@@ -725,6 +757,7 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    uid: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
@@ -744,6 +777,79 @@ providers:
     allowUiUpdates: true
     options:
       path: /etc/grafana/provisioning/dashboards
+EOF
+
+# --- Dashboards: community (pinned latest) + custom Patroni overview ---
+# Uses postgres-exporter (9628) and HAProxy prometheus-exporter (12693)curl -fsSL -m 60 "https://grafana.com/api/dashboards/9628/revisions/latest/download" \
+  -o config/grafana/dashboards/postgres.json \
+  || echo "[WARN] could not fetch dashboard 9628 (PostgreSQL)"
+curl -fsSL -m 60 "https://grafana.com/api/dashboards/12693/revisions/latest/download" \
+  -o config/grafana/dashboards/haproxy.json \
+  || echo "[WARN] could not fetch dashboard 12693 (HAProxy)"
+
+cat > config/grafana/dashboards/patroni.json <<'EOF'
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["patroni", "postgres"],
+  "templating": {"list": []},
+  "time": {"from": "now-3h", "to": "now"},
+  "timezone": "browser",
+  "title": "Patroni Cluster Overview",
+  "uid": "patroni-overview",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Postgres processes running",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(patroni_postgres_running)", "legendFormat": "running"}],
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "id": 2, "type": "stat", "title": "Leader",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(patroni_master)", "legendFormat": "leader"}],
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "id": 3, "type": "stat", "title": "Streaming replicas",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(patroni_postgres_streaming)", "legendFormat": "streaming"}],
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "id": 4, "type": "stat", "title": "DCS last seen (s ago)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "time() - min(patroni_dcs_last_seen)", "legendFormat": "age"}],
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Replication lag (bytes)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "patroni_xlog_location - patroni_xlog_replayed_location", "legendFormat": "{{instance}} replay lag"},
+        {"refId": "B", "expr": "patroni_xlog_location - patroni_xlog_received_location", "legendFormat": "{{instance}} receive lag"}
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "WAL position (bytes)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "patroni_xlog_location", "legendFormat": "{{instance}}"}
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}}
+    }
+  ]
+}
 EOF
 
 ### --------------------------------------------------------------------------
@@ -917,7 +1023,7 @@ cat <<EOM
 
 📈 **Monitoring:**
 •  HAProxy Stats: http://<server_ip>:7001 (admin:${CHECK_PASSWORD})
-•  Grafana: http://<server_ip>:3000 (admin:${POSTGRES_PASSWORD})
+•  Grafana: http://<server_ip>:3000 (admin:${POSTGRES_PASSWORD}) – dashboards auto-provisioned: Patroni Cluster Overview, PostgreSQL Database, HAProxy
 •  Prometheus: http://<server_ip>:9090
 
 ⚡ **Performance Optimizations Applied:**
