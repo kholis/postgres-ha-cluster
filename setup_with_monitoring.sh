@@ -75,6 +75,10 @@ export REPLICATION_PASSWORD=${REPLICATION_PASSWORD:-$(openssl rand -base64 32)}
 export CHECK_PASSWORD=${CHECK_PASSWORD:-$(openssl rand -base64 32)}
 export POOL_PASSWORD=${POOL_PASSWORD:-$(openssl rand -base64 32)}
 export ETCD_CLUSTER="etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380"
+# etcd CLIENT ports (2379) for Patroni – peer ports (2380) are only for etcd itself
+export ETCD_CLIENTS="etcd1:2379,etcd2:2379,etcd3:2379"
+# Basic auth header for Patroni REST API checks (haproxy/prometheus/healthcheck)
+export PATRONI_BASIC_AUTH=$(printf 'patroni:%s' "${CHECK_PASSWORD}" | base64 | tr -d '\n')
 
 # Calculate resource limits based on available system resources
 export PG_MEM_LIMIT=${PG_MEM_LIMIT:-$((TOTAL_MEM / 4))}M
@@ -131,9 +135,10 @@ defaults
 # ---------------------------------------------------------------------------
 listen postgres_rw
   bind *:5432
-  option pgsql-check user haproxy_check
   balance roundrobin
-  option httpchk GET /replica
+  # /primary returns 200 only on the leader – writes MUST hit the primary
+  option httpchk
+  http-check send meth GET uri /primary ver HTTP/1.1 hdr Authorization "Basic ${PATRONI_BASIC_AUTH}"
   http-check expect status 200
   default-server inter 2s fall 3 rise 2 on-marked-down shutdown-sessions
   server patroni1 patroni1:5432 check port 8008
@@ -145,9 +150,10 @@ listen postgres_rw
 # ---------------------------------------------------------------------------
 listen postgres_ro
   bind *:5433
-  option pgsql-check user haproxy_check
   balance roundrobin
-  option httpchk GET /replica
+  # /replica returns 200 only on standbys
+  option httpchk
+  http-check send meth GET uri /replica ver HTTP/1.1 hdr Authorization "Basic ${PATRONI_BASIC_AUTH}"
   http-check expect status 200
   default-server inter 2s fall 3 rise 2 on-marked-down shutdown-sessions
   server patroni1 patroni1:5432 check port 8008
@@ -165,45 +171,61 @@ listen stats
   stats refresh 10s
   stats auth admin:${CHECK_PASSWORD}
   stats admin if TRUE
+
+# Prometheus exporter endpoint (built into HAProxy 2.x)
+listen metrics
+  bind *:8404
+  mode http
+  http-request use-service prometheus-exporter if { path /metrics }
 EOF
 envsubst < config/haproxy.cfg > config/haproxy.cfg.tmp && mv config/haproxy.cfg.tmp config/haproxy.cfg
 
 ### --------------------------------------------------------------------------
-### 4. PgBouncer configuration (optimized for high concurrency)
+### 4. Patroni runtime image (pip-installed Patroni on top of Percona PG 17)
 ### --------------------------------------------------------------------------
-cat > config/pgbouncer.ini <<'EOF'
-[databases]
-rw = host=haproxy port=5432 user=pooler password=${POOL_PASSWORD}
-ro = host=haproxy port=5433 user=pooler password=${POOL_PASSWORD}
+# The stock percona/percona-distribution-postgresql image is plain PostgreSQL.
+# Multi-stage build: install Patroni + psycopg2 on python:3.9-slim, then copy
+# into the Percona image (matches its python3.9).
+cat > config/Dockerfile <<'EOF'
+FROM python:3.9-slim AS builder
+RUN pip install --no-cache-dir --prefix=/install "patroni[etcd3]~=4.0" "psycopg2-binary>=2.9.9"
 
-[pgbouncer]
-listen_addr        = 0.0.0.0
-listen_port        = 6432
-auth_type          = md5
-auth_file          = /etc/pgbouncer/userlist.txt
-pool_mode          = transaction
-max_client_conn    = 20000
-default_pool_size  = 500
-min_pool_size      = 50
-reserve_pool_size  = 100
-reserve_pool_timeout = 5
-max_db_connections = 1000
-max_user_connections = 1000
-server_reset_query = DISCARD ALL
-ignore_startup_parameters = extra_float_digits,application_name
-logfile            = /var/log/pgbouncer/pgbouncer.log
-pidfile            = /var/run/pgbouncer.pid
-verbose            = 2
-stats_period       = 60
-log_connections    = 1
-log_disconnections = 1
-log_pooler_errors  = 1
+FROM percona/percona-distribution-postgresql:17.5-2
+# Base image defaults to USER postgres – switch back for the install steps
+USER root
+COPY --from=builder /install /usr/local
+COPY patroni-entrypoint.sh /usr/local/bin/patroni-entrypoint.sh
+# Fix shebangs (builder python lives at /usr/local/bin/python; this image's is /usr/bin/python3)
+RUN chmod +x /usr/local/bin/patroni-entrypoint.sh \
+ && sed -i '1s|^.*$|#!/usr/bin/python3|' /usr/local/bin/patroni /usr/local/bin/patronictl \
+ && mkdir -p /data/db \
+ && chown postgres:root /data/db \
+ && chmod 700 /data/db \
+ && mkdir -p /home/postgres \
+ && chown postgres:root /home/postgres \
+ && chmod 750 /home/postgres
+ENV PYTHONPATH=/usr/local/lib/python3.9/site-packages
+ENV PATH=/usr/pgsql-17/bin:/usr/local/bin:${PATH}
+ENTRYPOINT ["/usr/local/bin/patroni-entrypoint.sh"]
 EOF
-envsubst < config/pgbouncer.ini > config/pgbouncer.ini.tmp && mv config/pgbouncer.ini.tmp config/pgbouncer.ini
 
-cat > config/userlist.txt <<EOF
-"pooler" "md5$(echo -n "${POOL_PASSWORD}${POOL_PASSWORD}" | md5sum | awk '{print $1}')"
+cat > config/patroni-entrypoint.sh <<'EOF'
+#!/bin/sh
+set -e
+
+DATA_DIR="/data/db"
+mkdir -p "$DATA_DIR" 2>/dev/null || true
+
+# Patroni refuses to run as root – drop to postgres via gosu
+if [ "$(id -u)" = "0" ]; then
+  chown postgres:root "$DATA_DIR" 2>/dev/null || true
+  chmod 700 "$DATA_DIR" 2>/dev/null || true
+  exec gosu postgres "/usr/local/bin/patroni-entrypoint.sh"
+fi
+
+exec patroni /etc/patroni.yml
 EOF
+chmod +x config/patroni-entrypoint.sh
 
 ### --------------------------------------------------------------------------
 ### 5. Shared Patroni bootstrap YAML snippet (optimized for 1M users)
@@ -221,9 +243,10 @@ restapi:
     username: patroni
     password: ${CHECK_PASSWORD}
 
-etcd:
-  hosts: ${ETCD_CLUSTER}
-  protocol: http
+# Patroni must use the etcd3 (gRPC) API – etcd 3.5 has the v2 API disabled.
+# Hosts are plain host:clientport (client port 2379, NOT the 2380 peer port).
+etcd3:
+  hosts: ${ETCD_CLIENTS}
 
 bootstrap:
   dcs:
@@ -281,7 +304,7 @@ bootstrap:
         
         # Replication
         max_replication_slots: 10
-        wal_keep_segments: 64
+        wal_keep_size: 1024
         
         # Security
         ssl: "off"
@@ -299,8 +322,10 @@ bootstrap:
         
   initdb:
     - encoding: UTF8
+    - locale: C.utf8
     - data-checksums
   pg_hba:
+    - local all all trust
     - host all all 0.0.0.0/0 md5
     - host replication replicator 0.0.0.0/0 md5
     - host all haproxy_check 0.0.0.0/0 md5
@@ -309,8 +334,8 @@ bootstrap:
 postgresql:
   listen: 0.0.0.0:5432
   connect_address: ${host}:5432
-  data_dir: /var/lib/postgresql/data
-  bin_dir: /usr/lib/postgresql/17/bin
+  data_dir: /data/db
+  bin_dir: /usr/pgsql-17/bin
   authentication:
     superuser:
       username: postgres
@@ -362,7 +387,7 @@ services:
   # Distributed Configuration Store – etcd (3 nodes for quorum)
   # -------------------------------------------------------------------------
   etcd1:
-    image: bitnami/etcd:3.5.9
+    image: bitnamilegacy/etcd:3.5.9
     hostname: etcd1
     networks: [pgnet]
     volumes:
@@ -393,7 +418,7 @@ services:
       retries: 3
 
   etcd2:
-    image: bitnami/etcd:3.5.9
+    image: bitnamilegacy/etcd:3.5.9
     hostname: etcd2
     networks: [pgnet]
     volumes:
@@ -424,7 +449,7 @@ services:
       retries: 3
 
   etcd3:
-    image: bitnami/etcd:3.5.9
+    image: bitnamilegacy/etcd:3.5.9
     hostname: etcd3
     networks: [pgnet]
     volumes:
@@ -458,7 +483,10 @@ services:
   # Patroni‑managed PostgreSQL nodes
   # -------------------------------------------------------------------------
   patroni1:
-    image: percona/percona-distribution-postgresql:17.5-2
+    build:
+      context: ./config
+      dockerfile: Dockerfile
+    image: pg-ha-patroni:pg17-local
     hostname: patroni1
     networks: [pgnet]
     depends_on:
@@ -469,13 +497,11 @@ services:
       etcd3:
         condition: service_healthy
     volumes:
-      - pgdata1:/var/lib/postgresql/data
+      - pgdata1:/data/db
       - ./config/patroni1.yml:/etc/patroni.yml:ro
       - ./logs:/var/log/postgresql
     environment:
       PATRONI_CONFIG_PATH: /etc/patroni.yml
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     deploy:
       resources:
         limits:
@@ -486,13 +512,17 @@ services:
           cpus: '0.5'
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "curl -fsu patroni:${CHECK_PASSWORD} http://localhost:8008/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 60s
 
   patroni2:
-    image: percona/percona-distribution-postgresql:17.5-2
+    build:
+      context: ./config
+      dockerfile: Dockerfile
+    image: pg-ha-patroni:pg17-local
     hostname: patroni2
     networks: [pgnet]
     depends_on:
@@ -503,13 +533,11 @@ services:
       etcd3:
         condition: service_healthy
     volumes:
-      - pgdata2:/var/lib/postgresql/data
+      - pgdata2:/data/db
       - ./config/patroni2.yml:/etc/patroni.yml:ro
       - ./logs:/var/log/postgresql
     environment:
       PATRONI_CONFIG_PATH: /etc/patroni.yml
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     deploy:
       resources:
         limits:
@@ -520,13 +548,17 @@ services:
           cpus: '0.5'
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "curl -fsu patroni:${CHECK_PASSWORD} http://localhost:8008/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 60s
 
   patroni3:
-    image: percona/percona-distribution-postgresql:17.5-2
+    build:
+      context: ./config
+      dockerfile: Dockerfile
+    image: pg-ha-patroni:pg17-local
     hostname: patroni3
     networks: [pgnet]
     depends_on:
@@ -537,13 +569,11 @@ services:
       etcd3:
         condition: service_healthy
     volumes:
-      - pgdata3:/var/lib/postgresql/data
+      - pgdata3:/data/db
       - ./config/patroni3.yml:/etc/patroni.yml:ro
       - ./logs:/var/log/postgresql
     environment:
       PATRONI_CONFIG_PATH: /etc/patroni.yml
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     deploy:
       resources:
         limits:
@@ -554,10 +584,11 @@ services:
           cpus: '0.5'
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "curl -fsu patroni:${CHECK_PASSWORD} http://localhost:8008/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 60s
 
   # -------------------------------------------------------------------------
   # HAProxy – read/write & read‑only VIPs + stats
@@ -664,21 +695,18 @@ rule_files:
   - "postgresql_rules.yml"
 
 scrape_configs:
-  - job_name: 'postgresql'
+  - job_name: 'patroni'
     static_configs:
-      - targets: ['patroni1:5432', 'patroni2:5432', 'patroni3:5432']
+      - targets: ['patroni1:8008', 'patroni2:8008', 'patroni3:8008']
     metrics_path: /metrics
+    basic_auth:
+      username: patroni
+      password: ${CHECK_PASSWORD}
     scrape_interval: 10s
 
   - job_name: 'haproxy'
     static_configs:
-      - targets: ['haproxy:7000']
-    metrics_path: /metrics
-    scrape_interval: 10s
-
-  - job_name: 'pgbouncer'
-    static_configs:
-      - targets: ['pgbouncer:6432']
+      - targets: ['haproxy:8404']
     metrics_path: /metrics
     scrape_interval: 10s
 
@@ -688,6 +716,7 @@ scrape_configs:
     metrics_path: /metrics
     scrape_interval: 10s
 EOF
+envsubst < config/prometheus.yml > config/prometheus.yml.tmp && mv config/prometheus.yml.tmp config/prometheus.yml
 
 # Grafana datasource
 cat > config/grafana/datasources/prometheus.yml <<'EOF'
@@ -724,11 +753,15 @@ cat > config/backup.sh <<'EOF'
 #!/bin/bash
 # Automated backup script for PostgreSQL cluster
 
-BACKUP_DIR="./pg-ha/backups"
+# Resolve script location so the job works from cron and any cwd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_DIR="$(dirname "$SCRIPT_DIR")"
+BACKUP_DIR="$COMPOSE_DIR/backups"
 DATE=$(date +%Y%m%d_%H%M%S)
 RETENTION_DAYS=7
 
 # Create backup directory
+cd "$COMPOSE_DIR"
 mkdir -p "$BACKUP_DIR"
 
 # Perform logical backup using pg_dump
@@ -749,18 +782,32 @@ chmod +x config/backup.sh
 ### 9. Start the cluster
 ### --------------------------------------------------------------------------
 echo "[INFO] Starting PostgreSQL HA cluster..."
-docker compose pull
-docker compose up -d
+docker compose pull --ignore-buildable
+docker compose up -d --build
 
-echo "[INFO] Waiting for Patroni primary to become available..."
-sleep 30   # give Patroni time to initialise
+echo "[INFO] Waiting for Patroni primary to become available via HAProxy..."
+PRIMARY_READY=0
+for i in $(seq 1 60); do
+  if docker compose exec -T -e PGPASSWORD="${POSTGRES_PASSWORD}" patroni1 \
+       psql -h haproxy -U postgres -d postgres -c '\q' >/dev/null 2>&1; then
+    PRIMARY_READY=1
+    echo "[INFO] Primary is up (attempt $i)"
+    break
+  fi
+  sleep 5
+done
+if [ "$PRIMARY_READY" != "1" ]; then
+  echo "[ERROR] Primary did not become available in time. Last logs:"
+  docker compose logs --tail=50 patroni1 patroni2 patroni3
+  exit 1
+fi
 
 ### --------------------------------------------------------------------------
 ### 10. Seed utility users and create monitoring user
 ### --------------------------------------------------------------------------
-for node in patroni1 patroni2 patroni3; do
-  if docker compose exec -T "$node" psql -U postgres -d postgres -c '\q' 2>/dev/null; then
-    docker compose exec -T "$node" psql -U postgres -d postgres <<EOSQL
+# Seed runs against the primary through HAProxy (port 5432) so it works
+# regardless of which node currently holds the leader role.
+docker compose exec -T -e PGPASSWORD="${POSTGRES_PASSWORD}" patroni1 psql -h haproxy -U postgres -d postgres <<EOSQL
 DO
 \$\$
 BEGIN
@@ -786,19 +833,18 @@ BEGIN
 END
 \$\$;
 
--- Create database outside of function
-CREATE DATABASE app_db OWNER app_user;
-GRANT ALL PRIVILEGES ON DATABASE app_db TO app_user;
+-- Create database outside of function (idempotent via \gexec)
+SELECT 'CREATE DATABASE app_db OWNER app_user;'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'app_db')\gexec
+SELECT 'GRANT ALL PRIVILEGES ON DATABASE app_db TO app_user;'
+WHERE EXISTS (SELECT FROM pg_database WHERE datname = 'app_db')\gexec
 EOSQL
-    break
-  fi
-done
 
 ### --------------------------------------------------------------------------
 ### 11. Setup automated backups
 ### --------------------------------------------------------------------------
 # Add to crontab for daily backups at 2 AM
-(crontab -l 2>/dev/null; echo "0 2 * * * $(pwd)/pg-ha/config/backup.sh") | crontab -
+(crontab -l 2>/dev/null | grep -v 'config/backup.sh'; echo "0 2 * * * $(pwd)/config/backup.sh") | crontab -
 
 ### --------------------------------------------------------------------------
 ### 12. Performance tuning script
@@ -838,17 +884,15 @@ chmod +x config/tune_performance.sh
 cat > config/health_check.sh <<'EOF'
 #!/bin/bash
 # Health check script for PostgreSQL cluster
+cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." || exit 1
 
 echo "Checking cluster health..."
 
 # Check Patroni status
-docker compose exec -T patroni1 patronictl list
+docker compose exec -T patroni1 patronictl -c /etc/patroni.yml list
 
 # Check HAProxy stats
 curl -s http://localhost:7001/ | grep -q "postgres" && echo "HAProxy: OK" || echo "HAProxy: FAILED"
-
-# Check PgBouncer
-docker compose exec -T pgbouncer psql -h localhost -p 6432 -U pooler -d rw -c "SELECT 1;" && echo "PgBouncer: OK" || echo "PgBouncer: FAILED"
 
 echo "Health check completed."
 EOF
@@ -884,7 +928,7 @@ cat <<EOM
 •  Monitoring with Prometheus + Grafana
 
 🔧 **Management Commands:**
-•  Check cluster status: docker compose exec patroni1 patronictl list
+•  Check cluster status: docker compose exec patroni1 patronictl -c /etc/patroni.yml list
 •  Health check: ./config/health_check.sh
 •  Manual backup: ./config/backup.sh
 •  Performance tuning: ./config/tune_performance.sh
